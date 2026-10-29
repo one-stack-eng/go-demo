@@ -13,3 +13,5 @@ bin/
 # IDE files
 .vscode/
 .idea/
+
+file.docx
