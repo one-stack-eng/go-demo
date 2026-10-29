@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -18,8 +19,6 @@ type store struct {
 type noteViewer struct{ notes *store }
 
 func (n *noteViewer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	defer r.Body.Close()
-	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	n.notes.mu.Lock()
 	ids := make([]string, 0, len(n.notes.notes))
 	for id := range n.notes.notes {
@@ -36,10 +35,13 @@ func (n *noteViewer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 type noteCreator struct{ notes *store }
 
 func (n *noteCreator) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	defer r.Body.Close()
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
+		if _, ok := errors.AsType[*http.MaxBytesError](err); ok {
+			http.Error(w, "body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
 		http.Error(w, "bad body", http.StatusBadRequest)
 		return
 	}
@@ -58,8 +60,6 @@ func (n *noteCreator) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 type noteDeleter struct{ notes *store }
 
 func (n *noteDeleter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	defer r.Body.Close()
-	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	id := r.PathValue("id")
 
 	n.notes.mu.Lock()
@@ -80,8 +80,6 @@ func (n *noteDeleter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 type noteViewerByID struct{ notes *store }
 
 func (n *noteViewerByID) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	defer r.Body.Close()
-	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	id := r.PathValue("id")
 
 	n.notes.mu.Lock()
