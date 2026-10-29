@@ -1,0 +1,15 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+bin/
+
+# Test binary, output of go coverage tool
+*.test
+*.out
+
+# IDE files
+.vscode/
+.idea/
