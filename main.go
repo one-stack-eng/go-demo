@@ -8,7 +8,9 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
+	"syscall"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -17,10 +19,95 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+type Config struct {
+	Addr              string
+	DatabaseURL       string
+	ReadTimeout       time.Duration
+	ReadHeaderTimeout time.Duration
+	WriteTimeout      time.Duration
+	IdleTimeout       time.Duration
+	ShutdownTimeout   time.Duration
+	DBConnectTimeout  time.Duration
+	MaxHeaderBytes    int
+}
 type Data struct {
 	ID int64 `db:"id"`
 }
 
+func loadConfig() (Config, error) {
+	cfg := Config{
+		Addr:              env("ADDR", ":8080"),
+		DatabaseURL:       os.Getenv("DATABASE_URL"),
+		ReadTimeout:       5 * time.Second,
+		ReadHeaderTimeout: 2 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		ShutdownTimeout:   15 * time.Second,
+		DBConnectTimeout:  10 * time.Second,
+		MaxHeaderBytes:    1 << 20,
+	}
+	var err error
+	if cfg.ReadTimeout, err = envDuration("READ_TIMEOUT", cfg.ReadTimeout); err != nil {
+		return Config{}, err
+	}
+	if cfg.ReadHeaderTimeout, err = envDuration("READ_HEADER_TIMEOUT", cfg.ReadHeaderTimeout); err != nil {
+		return Config{}, err
+	}
+	if cfg.WriteTimeout, err = envDuration("WRITE_TIMEOUT", cfg.WriteTimeout); err != nil {
+		return Config{}, err
+	}
+	if cfg.IdleTimeout, err = envDuration("IDLE_TIMEOUT", cfg.IdleTimeout); err != nil {
+		return Config{}, err
+	}
+	if cfg.ShutdownTimeout, err = envDuration("SHUTDOWN_TIMEOUT", cfg.ShutdownTimeout); err != nil {
+		return Config{}, err
+	}
+	if cfg.DBConnectTimeout, err = envDuration("DB_CONNECT_TIMEOUT", cfg.DBConnectTimeout); err != nil {
+		return Config{}, err
+	}
+	if cfg.MaxHeaderBytes, err = envInt("MAX_HEADER_BYTES", cfg.MaxHeaderBytes); err != nil {
+		return Config{}, err
+	}
+
+	if cfg.DatabaseURL == "" {
+		return Config{}, errors.New("DATABASE_URL is not set")
+	}
+	return cfg, nil
+}
+func env(key, def string) string {
+	if v, ok := os.LookupEnv(key); ok && v != "" {
+		return v
+	}
+	return def
+}
+func envDuration(key string, def time.Duration) (time.Duration, error) {
+	v, ok := os.LookupEnv(key)
+	if !ok || v == "" {
+		return def, nil
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return 0, fmt.Errorf("%s: invalid duration %q: %w", key, v, err)
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("%s: must be > 0, got %q", key, v)
+	}
+	return d, nil
+}
+func envInt(key string, def int) (int, error) {
+	v, ok := os.LookupEnv(key)
+	if !ok || v == "" {
+		return def, nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return 0, fmt.Errorf("%s: invalid int %q: %w", key, v, err)
+	}
+	if n <= 0 {
+		return 0, fmt.Errorf("%s: must be > 0, got %q", key, v)
+	}
+	return n, nil
+}
 func getNoteView(db *pgxpool.Pool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		rows, err := db.Query(r.Context(), `SELECT id FROM notes ORDER BY id`)
@@ -108,36 +195,38 @@ func getNoteByID(db *pgxpool.Pool) http.HandlerFunc {
 }
 
 func main() {
+	cfg, err := loadConfig()
+	if err != nil {
+		log.Fatalf("config: %v", err)
+	}
 	router := chi.NewRouter()
 	router.Use(middleware.Logger)
 	server := &http.Server{
-		Addr:              ":8080",
+		Addr:              cfg.Addr,
 		Handler:           router,
-		ReadTimeout:       5 * time.Second,
-		ReadHeaderTimeout: 2 * time.Second,
-		WriteTimeout:      10 * time.Second,
-		IdleTimeout:       120 * time.Second,
-		MaxHeaderBytes:    1 << 20}
+		ReadTimeout:       cfg.ReadTimeout,
+		ReadHeaderTimeout: cfg.ReadHeaderTimeout,
+		WriteTimeout:      cfg.WriteTimeout,
+		IdleTimeout:       cfg.IdleTimeout,
+		MaxHeaderBytes:    cfg.MaxHeaderBytes}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	dsn := os.Getenv("DATABASE_URL")
-	pool, err := pgxpool.New(ctx, dsn)
-	if dsn == "" {
-		log.Fatal("DATABASE_URL is not set")
-	}
+	ctx, cancel := context.WithTimeout(context.Background(), cfg.DBConnectTimeout)
+
+	pool, err := pgxpool.New(ctx, cfg.DatabaseURL)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("db pool: %v", err)
 	}
 	if err := pool.Ping(ctx); err != nil {
-		log.Fatal(err)
+		log.Fatalf("db ping: %v", err)
 	}
 	defer pool.Close()
+
 	if _, err := pool.Exec(ctx, `
 	CREATE TABLE IF NOT EXISTS notes (
 		id   BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
 		body BYTEA NOT NULL
 	)`); err != nil {
-		log.Fatal(err)
+		log.Fatalf("migrate: %v", err)
 	}
 	cancel()
 
@@ -146,7 +235,34 @@ func main() {
 	router.Post("/notes", createNote(pool))
 	router.Delete("/notes/{id}", deleteNote(pool))
 
-	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		log.Fatal(err)
+	sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	serverErr := make(chan error, 1)
+	go func() {
+		serverErr <- server.ListenAndServe()
+	}()
+
+	select {
+	case err := <-serverErr:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatalf("listen: %v", err)
+		}
+		return
+	case <-sigCtx.Done():
+		log.Printf("shutdown signal received, draining for up to %s", cfg.ShutdownTimeout)
 	}
+
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
+	defer cancelShutdown()
+
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		log.Printf("graceful shutdown failed: %v", err)
+		_ = server.Close()
+	}
+
+	if err := <-serverErr; err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Printf("server error: %v", err)
+	}
+	log.Println("shutdown complete")
 }
